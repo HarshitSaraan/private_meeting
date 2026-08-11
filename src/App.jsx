@@ -10,16 +10,21 @@ import PeopleDrawer from './components/PeopleDrawer';
 import RecordingBanner from './components/RecordingBanner';
 import { useRecorder } from './hooks/useRecorder';
 import { getScheduledMeetings, deleteScheduledMeeting, getUserProfile, saveUserProfile } from './utils/storage';
+import { UserCheck, ShieldCheck, Check, X, Clock, ArrowLeft } from 'lucide-react';
 
 export default function App() {
-  // Navigation State
+  // Navigation & Room State
   const [inMeeting, setInMeeting] = useState(false);
   const [meetingInfo, setMeetingInfo] = useState(null);
   const [userProfile, setUserProfile] = useState(getUserProfile());
   const [scheduledMeetings, setScheduledMeetings] = useState(getScheduledMeetings());
   const [isScheduleModalOpen, setIsScheduleModalOpen] = useState(false);
 
-  // In-Meeting Hardware Media State
+  // Knocking / Host Admission System State
+  const [knockingState, setKnockingState] = useState('none'); // 'none' | 'waiting' | 'declined'
+  const [knockRequests, setKnockRequests] = useState([]); // [{ userId, userName, roomCode }]
+
+  // In-Meeting Media State
   const [localStream, setLocalStream] = useState(null);
   const [micEnabled, setMicEnabled] = useState(true);
   const [videoEnabled, setVideoEnabled] = useState(true);
@@ -37,7 +42,7 @@ export default function App() {
   const [isPeopleOpen, setIsPeopleOpen] = useState(false);
   const [pinnedId, setPinnedId] = useState(null);
 
-  // In-Meeting Chat & Admin Rules
+  // Chat & Admin Controls
   const [chatMessages, setChatMessages] = useState([]);
   const [chatDisabled, setChatDisabled] = useState(false);
   const [unreadChatCount, setUnreadChatCount] = useState(0);
@@ -45,25 +50,66 @@ export default function App() {
   // Recorder Hook
   const { isRecording, recordTime, startRecording, stopRecording } = useRecorder();
 
-  // Reference for cleanup
   const localStreamRef = useRef(null);
+  const broadcastChannelRef = useRef(null);
 
-  // Check URL hash for direct meeting code join e.g. /#abc-defg-hij
+  // Setup BroadcastChannel for Real-Time Multi-Tab / Multi-Device Communication
   useEffect(() => {
-    const hash = window.location.hash.replace('#', '').trim();
-    if (hash && hash.length >= 6) {
-      // Auto fill join flow or ready state
-    }
-  }, []);
+    const channel = new BroadcastChannel('meet_private_channel');
+    broadcastChannelRef.current = channel;
 
-  // Synchronize mic/video tracks when toggled
+    channel.onmessage = (event) => {
+      const data = event.data;
+      if (!data || !data.type) return;
+
+      // Handle Host Admission Request
+      if (data.type === 'KNOCK_REQUEST') {
+        if (meetingInfo && meetingInfo.code === data.roomCode && isAdmin) {
+          setKnockRequests(prev => {
+            if (prev.some(r => r.userId === data.userId)) return prev;
+            return [...prev, { userId: data.userId, userName: data.userName, roomCode: data.roomCode }];
+          });
+        }
+      }
+
+      // Handle Host Accepted Admission
+      if (data.type === 'KNOCK_ACCEPTED') {
+        if (userProfile && userProfile.id === data.userId && knockingState === 'waiting') {
+          setKnockingState('none');
+          enterMeetingRoom(data.config);
+        }
+      }
+
+      // Handle Host Declined Admission
+      if (data.type === 'KNOCK_DECLINED') {
+        if (userProfile && userProfile.id === data.userId && knockingState === 'waiting') {
+          setKnockingState('declined');
+        }
+      }
+
+      // Sync Peer Joined
+      if (data.type === 'PEER_JOINED') {
+        if (meetingInfo && meetingInfo.code === data.roomCode) {
+          setParticipants(prev => {
+            if (prev.some(p => p.id === data.peer.id)) return prev;
+            return [...prev, data.peer];
+          });
+        }
+      }
+    };
+
+    return () => {
+      channel.close();
+    };
+  }, [meetingInfo, isAdmin, knockingState, userProfile]);
+
+  // Synchronize local stream tracks when toggled
   useEffect(() => {
     if (localStreamRef.current) {
       localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = micEnabled; });
       localStreamRef.current.getVideoTracks().forEach(t => { t.enabled = videoEnabled; });
     }
 
-    // Update self participant entry
     setParticipants(prev => prev.map(p => {
       if (p.isSelf) {
         return { ...p, micEnabled, videoEnabled, handRaised, isAdmin };
@@ -72,8 +118,28 @@ export default function App() {
     }));
   }, [micEnabled, videoEnabled, handRaised, isAdmin]);
 
-  // Start a new meeting room
+  // Start / Join Flow Trigger
   const handleStartMeeting = async (config) => {
+    // If user is meeting creator / owner -> Enter immediately
+    if (config.isOwner || config.isAdmin) {
+      enterMeetingRoom(config);
+    } else {
+      // Non-host user -> Knock / Request Admission from Host!
+      setMeetingInfo(config);
+      setKnockingState('waiting');
+
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage({
+          type: 'KNOCK_REQUEST',
+          roomCode: config.code,
+          userId: userProfile.id,
+          userName: config.userName
+        });
+      }
+    }
+  };
+
+  const enterMeetingRoom = async (config) => {
     setMeetingInfo(config);
     setIsAdmin(config.isAdmin);
     setMicEnabled(config.micInitial);
@@ -95,7 +161,7 @@ export default function App() {
     setLocalStream(userMediaStream);
 
     const selfUser = {
-      id: 'self_' + Date.now(),
+      id: userProfile.id || ('self_' + Date.now()),
       name: config.userName,
       isSelf: true,
       isAdmin: config.isAdmin,
@@ -107,46 +173,88 @@ export default function App() {
       stream: userMediaStream
     };
 
-    // Initial mock team peers for realistic team experience
-    const mockPeer1 = {
-      id: 'peer_1',
-      name: 'Sarah Chen (Lead Engineer)',
+    setParticipants([selfUser]);
+    setInMeeting(true);
+
+    // Broadcast PEER_JOINED to existing participants in room
+    if (broadcastChannelRef.current) {
+      broadcastChannelRef.current.postMessage({
+        type: 'PEER_JOINED',
+        roomCode: config.code,
+        peer: {
+          id: selfUser.id,
+          name: selfUser.name,
+          isSelf: false,
+          isAdmin: selfUser.isAdmin,
+          micEnabled: selfUser.micEnabled,
+          videoEnabled: selfUser.videoEnabled,
+          handRaised: false,
+          isSpeaking: false,
+          color: '#34a853'
+        }
+      });
+    }
+
+    setChatMessages([
+      {
+        id: 'msg_welcome',
+        sender: 'System',
+        text: `Joined ${config.title || 'Meeting'}. Private & secure session.`,
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        isSelf: false
+      }
+    ]);
+  };
+
+  // Host Action: Admit User
+  const handleAdmitUser = (request) => {
+    setKnockRequests(prev => prev.filter(r => r.userId !== request.userId));
+
+    // Add admitted user to host's active participant list
+    const newParticipant = {
+      id: request.userId,
+      name: request.userName,
       isSelf: false,
       isAdmin: false,
       micEnabled: true,
       videoEnabled: true,
       handRaised: false,
       isSpeaking: false,
-      color: '#34a853',
-      avatar: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&w=250&q=80'
+      color: '#' + Math.floor(Math.random()*16777215).toString(16)
     };
 
-    const mockPeer2 = {
-      id: 'peer_2',
-      name: 'David Miller (Product Manager)',
-      isSelf: false,
-      isAdmin: false,
-      micEnabled: false,
-      videoEnabled: true,
-      handRaised: false,
-      isSpeaking: false,
-      color: '#a142f4',
-      avatar: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=250&q=80'
-    };
+    setParticipants(prev => [...prev, newParticipant]);
 
-    setParticipants([selfUser, mockPeer1, mockPeer2]);
-    setInMeeting(true);
+    // Send Acceptance Broadcast to joining tab
+    if (broadcastChannelRef.current) {
+      broadcastChannelRef.current.postMessage({
+        type: 'KNOCK_ACCEPTED',
+        roomCode: request.roomCode,
+        userId: request.userId,
+        config: {
+          code: request.roomCode,
+          title: `Meeting (${request.roomCode})`,
+          isAdmin: false,
+          isOwner: false,
+          userName: request.userName,
+          micInitial: true,
+          videoInitial: true
+        }
+      });
+    }
+  };
 
-    // Initial Welcome Chat Message
-    setChatMessages([
-      {
-        id: 'msg_welcome',
-        sender: 'System Bot',
-        text: `Welcome to ${config.title}. Meeting room encrypted & private for your team.`,
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        isSelf: false
-      }
-    ]);
+  // Host Action: Decline User
+  const handleDeclineUser = (request) => {
+    setKnockRequests(prev => prev.filter(r => r.userId !== request.userId));
+
+    if (broadcastChannelRef.current) {
+      broadcastChannelRef.current.postMessage({
+        type: 'KNOCK_DECLINED',
+        roomCode: request.roomCode,
+        userId: request.userId
+      });
+    }
   };
 
   const handleLeaveMeeting = () => {
@@ -162,6 +270,7 @@ export default function App() {
     setLocalStream(null);
     setInMeeting(false);
     setMeetingInfo(null);
+    setKnockingState('none');
     setIsWhiteboardOpen(false);
     setIsChatOpen(false);
     setIsPeopleOpen(false);
@@ -195,7 +304,7 @@ export default function App() {
     }
   };
 
-  // In-Meeting Chat Messages
+  // Chat Messages
   const handleSendMessage = (text) => {
     const newMsg = {
       id: 'msg_' + Date.now(),
@@ -207,7 +316,6 @@ export default function App() {
     setChatMessages(prev => [...prev, newMsg]);
   };
 
-  // Admin Actions: Mute All Mics
   const handleAdminMuteAll = () => {
     setParticipants(prev => prev.map(p => {
       if (!p.isSelf && !p.isAdmin) {
@@ -215,65 +323,25 @@ export default function App() {
       }
       return p;
     }));
-    
-    // Add system notification in chat
-    setChatMessages(prev => [...prev, {
-      id: 'msg_sys_' + Date.now(),
-      sender: 'Admin Control',
-      text: 'Host muted microphones of all participants.',
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      isSelf: false
-    }]);
   };
 
-  // Admin Actions: Toggle Chat Disable
   const handleAdminToggleChatDisable = () => {
-    const nextState = !chatDisabled;
-    setChatDisabled(nextState);
-    setChatMessages(prev => [...prev, {
-      id: 'msg_sys_' + Date.now(),
-      sender: 'Admin Control',
-      text: nextState ? 'In-meeting chat disabled by Admin.' : 'In-meeting chat re-enabled by Admin.',
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      isSelf: false
-    }]);
+    setChatDisabled(prev => !prev);
   };
 
-  // Admin Actions: Grant or Revoke Admin (Multiple Admin support!)
   const handleToggleAdminRole = (participantId) => {
     setParticipants(prev => prev.map(p => {
       if (p.id === participantId) {
-        const nextAdmin = !p.isAdmin;
-        return { ...p, isAdmin: nextAdmin };
+        return { ...p, isAdmin: !p.isAdmin };
       }
       return p;
     }));
   };
 
-  // Admin Actions: Kick / Remove Participant
   const handleRemoveParticipant = (participantId) => {
     setParticipants(prev => prev.filter(p => p.id !== participantId));
   };
 
-  // Admin / Testing Helper: Spawn extra simulated peer
-  const handleAddSimulatedPeer = () => {
-    const names = ['Alex Rivera', 'Elena Rostova', 'Marcus Vance', 'Priya Sharma', 'Jordan Lee'];
-    const randomName = names[Math.floor(Math.random() * names.length)] + ` (${Math.floor(10 + Math.random() * 90)})`;
-    const newPeer = {
-      id: 'peer_' + Date.now(),
-      name: randomName,
-      isSelf: false,
-      isAdmin: false,
-      micEnabled: true,
-      videoEnabled: true,
-      handRaised: Math.random() > 0.5,
-      isSpeaking: false,
-      color: '#' + Math.floor(Math.random()*16777215).toString(16)
-    };
-    setParticipants(prev => [...prev, newPeer]);
-  };
-
-  // Admin Recording Toggle
   const handleToggleRecording = () => {
     if (isRecording) {
       stopRecording();
@@ -285,13 +353,8 @@ export default function App() {
   return (
     <div className="w-screen h-screen flex flex-col bg-[#121316] text-[#e8eaed] overflow-hidden select-none">
       
-      {/* Navigation Header */}
-      <Navbar
-        inMeeting={inMeeting}
-        meetingInfo={meetingInfo}
-        userProfile={userProfile}
-        onLeaveMeeting={handleLeaveMeeting}
-      />
+      {/* Top Navbar (Renders on homepage, null in meeting) */}
+      <Navbar inMeeting={inMeeting} />
 
       {/* Recording Banner Alert */}
       <RecordingBanner
@@ -300,7 +363,88 @@ export default function App() {
         onStopRecording={stopRecording}
       />
 
-      {/* Main Viewport Container */}
+      {/* Host Admission Request Banner (Floating for Admin) */}
+      {isAdmin && knockRequests.length > 0 && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-2">
+          {knockRequests.map(req => (
+            <div 
+              key={req.userId}
+              className="px-5 py-3 rounded-2xl bg-[#28292c] border border-blue-500/50 text-white shadow-2xl flex items-center gap-4 animate-bounce"
+            >
+              <div className="flex items-center gap-2 text-xs font-semibold">
+                <UserCheck className="w-4 h-4 text-blue-400" />
+                <span><strong className="text-blue-300">{req.userName}</strong> wants to join this meeting</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => handleAdmitUser(req)}
+                  className="px-3 py-1 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold flex items-center gap-1 shadow"
+                >
+                  <Check className="w-3.5 h-3.5" /> Admit
+                </button>
+                <button
+                  onClick={() => handleDeclineUser(req)}
+                  className="px-3 py-1 rounded-full bg-red-600 hover:bg-red-700 text-white text-xs font-semibold flex items-center gap-1 shadow"
+                >
+                  <X className="w-3.5 h-3.5" /> Decline
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Waiting Room / Knocking Overlay Modal for Joining User */}
+      {knockingState === 'waiting' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in">
+          <div className="w-full max-w-md bg-[#202124] border border-white/10 rounded-2xl p-8 text-center space-y-6 shadow-2xl">
+            <div className="w-16 h-16 rounded-full bg-blue-500/10 border border-blue-500/30 flex items-center justify-center mx-auto text-blue-400 animate-pulse">
+              <Clock className="w-8 h-8" />
+            </div>
+
+            <div className="space-y-2">
+              <h3 className="text-xl font-bold text-white">Asking host to let you in...</h3>
+              <p className="text-xs text-slate-400">
+                You'll join the meeting as soon as the host accepts your request.
+              </p>
+            </div>
+
+            <button
+              onClick={() => setKnockingState('none')}
+              className="btn btn-secondary px-6 py-2 text-xs font-semibold"
+            >
+              Cancel Request
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Declined Overlay Modal */}
+      {knockingState === 'declined' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in">
+          <div className="w-full max-w-md bg-[#202124] border border-red-500/30 rounded-2xl p-8 text-center space-y-6 shadow-2xl">
+            <div className="w-16 h-16 rounded-full bg-red-500/10 border border-red-500/30 flex items-center justify-center mx-auto text-red-400">
+              <X className="w-8 h-8" />
+            </div>
+
+            <div className="space-y-2">
+              <h3 className="text-xl font-bold text-white">Host declined your request</h3>
+              <p className="text-xs text-slate-400">
+                The meeting host has declined your request to join this session.
+              </p>
+            </div>
+
+            <button
+              onClick={() => setKnockingState('none')}
+              className="btn btn-primary px-6 py-2 text-xs font-semibold flex items-center gap-1.5 mx-auto"
+            >
+              <ArrowLeft className="w-4 h-4" /> Return to Homepage
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Main Content Area */}
       <main className="flex-1 relative w-full h-full overflow-hidden flex">
         {!inMeeting ? (
           <HomeLobby
@@ -323,9 +467,11 @@ export default function App() {
         )}
       </main>
 
-      {/* In-Meeting Bottom Control Strip */}
+      {/* In-Meeting Bottom Control Bar */}
       {inMeeting && (
         <ControlBar
+          meetingCode={meetingInfo?.code}
+          meetingTitle={meetingInfo?.title}
           micEnabled={micEnabled}
           onToggleMic={() => setMicEnabled(!micEnabled)}
           videoEnabled={videoEnabled}
@@ -374,7 +520,6 @@ export default function App() {
         chatDisabled={chatDisabled}
         onToggleAdminRole={handleToggleAdminRole}
         onRemoveParticipant={handleRemoveParticipant}
-        onAddSimulatedPeer={handleAddSimulatedPeer}
       />
 
       <ScheduleModal

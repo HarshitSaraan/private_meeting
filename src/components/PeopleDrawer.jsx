@@ -1,7 +1,7 @@
 import React from 'react';
 import { 
   X, Users, Mic, MicOff, Video, VideoOff, ShieldCheck, 
-  Hand, Shield, VolumeX, MessageSquareOff, UserPlus, Trash2 
+  Hand, Shield, VolumeX, MessageSquareOff, Trash2 
 } from 'lucide-react';
 
 export default function PeopleDrawer({ 
@@ -14,13 +14,12 @@ export default function PeopleDrawer({
   onToggleChatDisable,
   chatDisabled,
   onToggleAdminRole,
-  onRemoveParticipant,
-  onAddSimulatedPeer
+  onRemoveParticipant
 }) {
   if (!isOpen) return null;
 
   return (
-    <div className="fixed right-4 top-20 bottom-24 w-80 md:w-96 bg-[#202124] border border-white/10 rounded-2xl shadow-2xl z-40 flex flex-col overflow-hidden text-slate-200 animate-fade-in">
+    <div className="fixed right-4 top-4 bottom-24 w-80 md:w-96 bg-[#202124] border border-white/10 rounded-2xl shadow-2xl z-40 flex flex-col overflow-hidden text-slate-200 animate-fade-in">
       
       {/* Header */}
       <div className="px-5 py-4 border-b border-white/10 flex items-center justify-between bg-[#28292c]">
@@ -66,14 +65,6 @@ export default function PeopleDrawer({
               <span>{chatDisabled ? 'Enable Chat' : 'Disable Chat'}</span>
             </button>
           </div>
-
-          <button
-            onClick={onAddSimulatedPeer}
-            className="w-full py-2 rounded-xl bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors"
-          >
-            <UserPlus className="w-4 h-4" />
-            <span>Simulate Team Member</span>
-          </button>
         </div>
       )}
 
@@ -130,7 +121,7 @@ export default function PeopleDrawer({
                         ? 'bg-blue-500/20 text-blue-300 hover:bg-blue-500/30' 
                         : 'bg-white/5 text-slate-400 hover:text-white hover:bg-white/10'
                     }`}
-                    title={p.isAdmin ? "Demote from Admin" : "Make Admin (Multiple Admin)"}
+                    title={p.isAdmin ? "Demote from Admin" : "Make Admin"}
                   >
                     <Shield className="w-3.5 h-3.5" />
                   </button>
