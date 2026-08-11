@@ -1,14 +1,33 @@
 import React, { useRef, useEffect } from 'react';
 import { Mic, MicOff, Hand, ShieldCheck, User } from 'lucide-react';
+import { createPeerVideoStream } from '../utils/mediaStream';
 
 export default function VideoTile({ participant, isSelf, isPresenter, onPin }) {
   const videoRef = useRef(null);
 
   useEffect(() => {
-    if (videoRef.current && participant.stream) {
-      videoRef.current.srcObject = participant.stream;
+    let activePeerStream = null;
+
+    if (participant.videoEnabled) {
+      if (participant.stream) {
+        if (videoRef.current) {
+          videoRef.current.srcObject = participant.stream;
+        }
+      } else {
+        // Generate synthetic video stream for peer so camera is visibly ACTIVE
+        activePeerStream = createPeerVideoStream(participant.name, participant.color);
+        if (videoRef.current) {
+          videoRef.current.srcObject = activePeerStream;
+        }
+      }
     }
-  }, [participant.stream, participant.videoEnabled]);
+
+    return () => {
+      if (activePeerStream && activePeerStream._cleanup) {
+        activePeerStream._cleanup();
+      }
+    };
+  }, [participant.stream, participant.videoEnabled, participant.name, participant.color]);
 
   return (
     <div 
@@ -17,12 +36,12 @@ export default function VideoTile({ participant, isSelf, isPresenter, onPin }) {
       }`}
     >
       {/* Video Stream or Avatar Fallback */}
-      {participant.videoEnabled && participant.stream ? (
+      {participant.videoEnabled ? (
         <video
           ref={videoRef}
           autoPlay
           playsInline
-          muted={isSelf} // prevent echo for local stream
+          muted={isSelf} // prevent local audio echo
           className={`w-full h-full object-cover ${isSelf ? 'scale-x-[-1]' : ''}`}
         />
       ) : (
@@ -30,7 +49,7 @@ export default function VideoTile({ participant, isSelf, isPresenter, onPin }) {
           <div className="relative">
             <div 
               className={`w-20 h-20 rounded-full flex items-center justify-center text-white font-bold text-2xl shadow-xl transition-all ${
-                participant.isSpeaking ? 'ring-4 ring-emerald-500/80 scale-105' : ''
+                participant.micEnabled ? 'ring-4 ring-emerald-500/80 scale-105' : ''
               }`}
               style={{ backgroundColor: participant.color || '#1a73e8' }}
             >
@@ -41,8 +60,8 @@ export default function VideoTile({ participant, isSelf, isPresenter, onPin }) {
               )}
             </div>
 
-            {/* Speaking Pulse Wave Animation */}
-            {participant.isSpeaking && (
+            {/* Speaking Pulse Wave Animation when Mic is ON */}
+            {participant.micEnabled && (
               <span className="absolute -inset-2 rounded-full border-2 border-emerald-400 animate-ping opacity-75"></span>
             )}
           </div>
