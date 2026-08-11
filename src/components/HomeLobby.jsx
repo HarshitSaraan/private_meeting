@@ -38,7 +38,7 @@ export default function HomeLobby({
     onStartMeeting({
       code,
       title: `Meeting (${code})`,
-      isAdmin: true, // Meeting creator is Primary Admin / Host
+      isAdmin: true, // Creator is Host
       isOwner: true,
       userName: userName.trim(),
       micInitial: true,
@@ -110,14 +110,14 @@ export default function HomeLobby({
           </div>
           
           <h1 className="text-4xl md:text-5xl font-bold tracking-tight text-white leading-tight">
-            Designed for <span className="bg-gradient-to-r from-blue-400 via-teal-300 to-indigo-400 bg-clip-text text-transparent">preproute</span>
+            designed for <span className="bg-gradient-to-r from-blue-400 via-teal-300 to-indigo-400 bg-clip-text text-transparent">thepreproute</span>
           </h1>
         </div>
 
         {/* Form Container */}
         <div className="bg-[#202124] p-6 md:p-8 rounded-2xl border border-white/10 shadow-2xl space-y-6">
           
-          {/* Display Name Input (Blank by default, Red if missing) */}
+          {/* Display Name Input */}
           <div className="space-y-2">
             <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center justify-between">
               <span className="flex items-center gap-1.5">
@@ -192,7 +192,7 @@ export default function HomeLobby({
 
         </div>
 
-        {/* Scheduled Meetings Dashboard Section */}
+        {/* Scheduled Meetings Section */}
         {scheduledMeetings.length > 0 && (
           <div className="w-full space-y-4 pt-2">
             <div className="flex items-center justify-between">

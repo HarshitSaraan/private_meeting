@@ -10,7 +10,7 @@ import PeopleDrawer from './components/PeopleDrawer';
 import RecordingBanner from './components/RecordingBanner';
 import { useRecorder } from './hooks/useRecorder';
 import { getScheduledMeetings, deleteScheduledMeeting, getUserProfile, saveUserProfile } from './utils/storage';
-import { UserCheck, ShieldCheck, Check, X, Clock, ArrowLeft } from 'lucide-react';
+import { UserCheck, Check, X, Clock, ArrowLeft } from 'lucide-react';
 
 export default function App() {
   // Navigation & Room State
@@ -26,8 +26,8 @@ export default function App() {
 
   // In-Meeting Media State
   const [localStream, setLocalStream] = useState(null);
-  const [micEnabled, setMicEnabled] = useState(true);
-  const [videoEnabled, setVideoEnabled] = useState(true);
+  const [micEnabled, setMicEnabled] = useState(false);
+  const [videoEnabled, setVideoEnabled] = useState(false);
   const [screenShareStream, setScreenShareStream] = useState(null);
   const [screenSharerName, setScreenSharerName] = useState('');
 
@@ -52,8 +52,10 @@ export default function App() {
 
   const localStreamRef = useRef(null);
   const broadcastChannelRef = useRef(null);
+  const meetingInfoRef = useRef(meetingInfo);
+  meetingInfoRef.current = meetingInfo;
 
-  // Setup BroadcastChannel for Real-Time Multi-Tab / Multi-Device Communication
+  // Real-Time BroadcastChannel Setup for Multi-Tab / Peer Synchronization
   useEffect(() => {
     const channel = new BroadcastChannel('meet_private_channel');
     broadcastChannelRef.current = channel;
@@ -62,9 +64,11 @@ export default function App() {
       const data = event.data;
       if (!data || !data.type) return;
 
-      // Handle Host Admission Request
+      const currentRoomCode = meetingInfoRef.current?.code;
+
+      // 1. Host receives Admission Request from joining peer
       if (data.type === 'KNOCK_REQUEST') {
-        if (meetingInfo && meetingInfo.code === data.roomCode && isAdmin) {
+        if (currentRoomCode === data.roomCode && isAdmin) {
           setKnockRequests(prev => {
             if (prev.some(r => r.userId === data.userId)) return prev;
             return [...prev, { userId: data.userId, userName: data.userName, roomCode: data.roomCode }];
@@ -72,27 +76,73 @@ export default function App() {
         }
       }
 
-      // Handle Host Accepted Admission
+      // 2. Joining user receives Acceptance from Host
       if (data.type === 'KNOCK_ACCEPTED') {
         if (userProfile && userProfile.id === data.userId && knockingState === 'waiting') {
           setKnockingState('none');
-          enterMeetingRoom(data.config);
+          // Enter meeting with all active room participants passed by Host
+          enterMeetingRoom(data.config, data.existingParticipants || []);
         }
       }
 
-      // Handle Host Declined Admission
+      // 3. Joining user receives Decline from Host
       if (data.type === 'KNOCK_DECLINED') {
         if (userProfile && userProfile.id === data.userId && knockingState === 'waiting') {
           setKnockingState('declined');
         }
       }
 
-      // Sync Peer Joined
+      // 4. Peer Joined Announcement
       if (data.type === 'PEER_JOINED') {
-        if (meetingInfo && meetingInfo.code === data.roomCode) {
+        if (currentRoomCode === data.roomCode) {
           setParticipants(prev => {
             if (prev.some(p => p.id === data.peer.id)) return prev;
             return [...prev, data.peer];
+          });
+        }
+      }
+
+      // 5. Peer Left Announcement -> Immediately remove leaving user from participants list
+      if (data.type === 'PEER_LEFT') {
+        if (currentRoomCode === data.roomCode) {
+          setParticipants(prev => prev.filter(p => p.id !== data.userId));
+        }
+      }
+
+      // 6. Peer Status Update (Mic/Video/Hand Toggle Sync)
+      if (data.type === 'PEER_STATUS_UPDATE') {
+        if (currentRoomCode === data.roomCode) {
+          setParticipants(prev => prev.map(p => {
+            if (p.id === data.userId) {
+              return { 
+                ...p, 
+                micEnabled: data.micEnabled, 
+                videoEnabled: data.videoEnabled, 
+                handRaised: data.handRaised 
+              };
+            }
+            return p;
+          }));
+        }
+      }
+
+      // 7. Request Peer Presence Response
+      if (data.type === 'WHO_IS_HERE') {
+        if (currentRoomCode === data.roomCode && inMeeting) {
+          // Respond with self details
+          channel.postMessage({
+            type: 'PEER_JOINED',
+            roomCode: currentRoomCode,
+            peer: {
+              id: userProfile.id,
+              name: userProfile.name,
+              isSelf: false,
+              isAdmin: isAdmin,
+              micEnabled: micEnabled,
+              videoEnabled: videoEnabled,
+              handRaised: handRaised,
+              color: '#34a853'
+            }
           });
         }
       }
@@ -101,30 +151,89 @@ export default function App() {
     return () => {
       channel.close();
     };
-  }, [meetingInfo, isAdmin, knockingState, userProfile]);
+  }, [isAdmin, knockingState, userProfile, inMeeting, micEnabled, videoEnabled, handRaised]);
 
-  // Synchronize local stream tracks when toggled
-  useEffect(() => {
-    if (localStreamRef.current) {
-      localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = micEnabled; });
-      localStreamRef.current.getVideoTracks().forEach(t => { t.enabled = videoEnabled; });
+  // Request browser hardware permissions and capture live stream
+  const requestMediaPermissions = async (requestVideo = true, requestAudio = true) => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: requestVideo ? { width: { ideal: 1280 }, height: { ideal: 720 } } : false,
+        audio: requestAudio
+      });
+
+      localStreamRef.current = stream;
+      setLocalStream(stream);
+
+      // Update local participant stream
+      setParticipants(prev => prev.map(p => {
+        if (p.isSelf) {
+          return { ...p, stream, videoEnabled: requestVideo, micEnabled: requestAudio };
+        }
+        return p;
+      }));
+
+      return stream;
+    } catch (err) {
+      console.warn('Browser media permission rejected or fallback:', err);
+      return null;
+    }
+  };
+
+  // Toggle Mic with Browser Permission Request
+  const handleToggleMic = async () => {
+    const nextMicState = !micEnabled;
+    setMicEnabled(nextMicState);
+
+    if (nextMicState && !localStreamRef.current) {
+      await requestMediaPermissions(videoEnabled, true);
+    } else if (localStreamRef.current) {
+      localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = nextMicState; });
     }
 
-    setParticipants(prev => prev.map(p => {
-      if (p.isSelf) {
-        return { ...p, micEnabled, videoEnabled, handRaised, isAdmin };
-      }
-      return p;
-    }));
-  }, [micEnabled, videoEnabled, handRaised, isAdmin]);
+    // Broadcast status change to all peers
+    broadcastStatusChange(nextMicState, videoEnabled, handRaised);
+  };
+
+  // Toggle Camera with Browser Permission Request
+  const handleToggleVideo = async () => {
+    const nextVideoState = !videoEnabled;
+    setVideoEnabled(nextVideoState);
+
+    if (nextVideoState && !localStreamRef.current) {
+      await requestMediaPermissions(true, micEnabled);
+    } else if (localStreamRef.current) {
+      localStreamRef.current.getVideoTracks().forEach(t => { t.enabled = nextVideoState; });
+    }
+
+    // Broadcast status change to all peers
+    broadcastStatusChange(micEnabled, nextVideoState, handRaised);
+  };
+
+  // Toggle Hand Raised
+  const handleToggleHand = () => {
+    const nextHand = !handRaised;
+    setHandRaised(nextHand);
+    broadcastStatusChange(micEnabled, videoEnabled, nextHand);
+  };
+
+  const broadcastStatusChange = (mic, vid, hand) => {
+    if (broadcastChannelRef.current && meetingInfo) {
+      broadcastChannelRef.current.postMessage({
+        type: 'PEER_STATUS_UPDATE',
+        roomCode: meetingInfo.code,
+        userId: userProfile.id,
+        micEnabled: mic,
+        videoEnabled: vid,
+        handRaised: hand
+      });
+    }
+  };
 
   // Start / Join Flow Trigger
   const handleStartMeeting = async (config) => {
-    // If user is meeting creator / owner -> Enter immediately
     if (config.isOwner || config.isAdmin) {
       enterMeetingRoom(config);
     } else {
-      // Non-host user -> Knock / Request Admission from Host!
       setMeetingInfo(config);
       setKnockingState('waiting');
 
@@ -139,44 +248,33 @@ export default function App() {
     }
   };
 
-  const enterMeetingRoom = async (config) => {
+  const enterMeetingRoom = async (config, initialPeers = []) => {
     setMeetingInfo(config);
     setIsAdmin(config.isAdmin);
-    setMicEnabled(config.micInitial);
-    setVideoEnabled(config.videoInitial);
-
-    let userMediaStream = null;
-    try {
-      if (config.micInitial || config.videoInitial) {
-        userMediaStream = await navigator.mediaDevices.getUserMedia({
-          video: config.videoInitial ? { width: { ideal: 1280 }, height: { ideal: 720 } } : false,
-          audio: config.micInitial
-        });
-      }
-    } catch (e) {
-      console.warn('getUserMedia fallback:', e);
-    }
-
-    localStreamRef.current = userMediaStream;
-    setLocalStream(userMediaStream);
 
     const selfUser = {
       id: userProfile.id || ('self_' + Date.now()),
       name: config.userName,
       isSelf: true,
       isAdmin: config.isAdmin,
-      micEnabled: config.micInitial,
-      videoEnabled: config.videoInitial,
+      micEnabled: false,
+      videoEnabled: false,
       handRaised: false,
       isSpeaking: false,
       color: '#1a73e8',
-      stream: userMediaStream
+      stream: null
     };
 
-    setParticipants([selfUser]);
+    // Filter out duplicate self entries from initial peers
+    const sanitizedPeers = initialPeers.filter(p => p.id !== selfUser.id).map(p => ({
+      ...p,
+      isSelf: false
+    }));
+
+    setParticipants([selfUser, ...sanitizedPeers]);
     setInMeeting(true);
 
-    // Broadcast PEER_JOINED to existing participants in room
+    // Announce presence to room
     if (broadcastChannelRef.current) {
       broadcastChannelRef.current.postMessage({
         type: 'PEER_JOINED',
@@ -186,12 +284,17 @@ export default function App() {
           name: selfUser.name,
           isSelf: false,
           isAdmin: selfUser.isAdmin,
-          micEnabled: selfUser.micEnabled,
-          videoEnabled: selfUser.videoEnabled,
+          micEnabled: false,
+          videoEnabled: false,
           handRaised: false,
-          isSpeaking: false,
           color: '#34a853'
         }
+      });
+
+      // Ask existing peers in room to announce themselves
+      broadcastChannelRef.current.postMessage({
+        type: 'WHO_IS_HERE',
+        roomCode: config.code
       });
     }
 
@@ -206,26 +309,38 @@ export default function App() {
     ]);
   };
 
-  // Host Action: Admit User
+  // Host Action: Admit User (Sends existing participant list to joining user!)
   const handleAdmitUser = (request) => {
     setKnockRequests(prev => prev.filter(r => r.userId !== request.userId));
 
-    // Add admitted user to host's active participant list
     const newParticipant = {
       id: request.userId,
       name: request.userName,
       isSelf: false,
       isAdmin: false,
-      micEnabled: true,
-      videoEnabled: true,
+      micEnabled: false,
+      videoEnabled: false,
       handRaised: false,
       isSpeaking: false,
       color: '#' + Math.floor(Math.random()*16777215).toString(16)
     };
 
-    setParticipants(prev => [...prev, newParticipant]);
+    setParticipants(prev => {
+      if (prev.some(p => p.id === newParticipant.id)) return prev;
+      return [...prev, newParticipant];
+    });
 
-    // Send Acceptance Broadcast to joining tab
+    // Send complete participant list to joining user so they see Host & everyone
+    const currentParticipantList = participants.map(p => ({
+      id: p.id,
+      name: p.name,
+      isAdmin: p.isAdmin,
+      micEnabled: p.micEnabled,
+      videoEnabled: p.videoEnabled,
+      handRaised: p.handRaised,
+      color: p.color
+    }));
+
     if (broadcastChannelRef.current) {
       broadcastChannelRef.current.postMessage({
         type: 'KNOCK_ACCEPTED',
@@ -237,9 +352,10 @@ export default function App() {
           isAdmin: false,
           isOwner: false,
           userName: request.userName,
-          micInitial: true,
-          videoInitial: true
-        }
+          micInitial: false,
+          videoInitial: false
+        },
+        existingParticipants: currentParticipantList
       });
     }
   };
@@ -257,6 +373,7 @@ export default function App() {
     }
   };
 
+  // User Leaves Meeting -> Broadcast PEER_LEFT so all participants immediately update list!
   const handleLeaveMeeting = () => {
     if (isRecording) stopRecording();
     if (screenShareStream) {
@@ -267,6 +384,16 @@ export default function App() {
       localStreamRef.current.getTracks().forEach(t => t.stop());
       localStreamRef.current = null;
     }
+
+    // Broadcast PEER_LEFT event to all connected room members
+    if (broadcastChannelRef.current && meetingInfo) {
+      broadcastChannelRef.current.postMessage({
+        type: 'PEER_LEFT',
+        roomCode: meetingInfo.code,
+        userId: userProfile.id
+      });
+    }
+
     setLocalStream(null);
     setInMeeting(false);
     setMeetingInfo(null);
@@ -275,6 +402,9 @@ export default function App() {
     setIsChatOpen(false);
     setIsPeopleOpen(false);
     setHandRaised(false);
+    setMicEnabled(false);
+    setVideoEnabled(false);
+    setParticipants([]);
   };
 
   // Screen Share Toggle
@@ -473,13 +603,13 @@ export default function App() {
           meetingCode={meetingInfo?.code}
           meetingTitle={meetingInfo?.title}
           micEnabled={micEnabled}
-          onToggleMic={() => setMicEnabled(!micEnabled)}
+          onToggleMic={handleToggleMic}
           videoEnabled={videoEnabled}
-          onToggleVideo={() => setVideoEnabled(!videoEnabled)}
+          onToggleVideo={handleToggleVideo}
           isScreenSharing={!!screenShareStream}
           onToggleScreenShare={handleToggleScreenShare}
           handRaised={handRaised}
-          onToggleHand={() => setHandRaised(!handRaised)}
+          onToggleHand={handleToggleHand}
           isWhiteboardOpen={isWhiteboardOpen}
           onToggleWhiteboard={() => setIsWhiteboardOpen(!isWhiteboardOpen)}
           isChatOpen={isChatOpen}
