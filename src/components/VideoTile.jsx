@@ -6,30 +6,14 @@ export default function VideoTile({ participant, isSelf, isPresenter, onPin }) {
   const videoRef = useRef(null);
 
   useEffect(() => {
-    let activePeerStream = null;
-
-    if (participant.videoEnabled) {
-      if (participant.stream) {
-        if (videoRef.current) {
-          videoRef.current.srcObject = participant.stream;
-        }
-      } else {
-        // Generate synthetic video stream for peer so camera indicator renders if media stream unavailable
-        activePeerStream = createPeerVideoStream(participant.name, participant.color);
-        if (videoRef.current) {
-          videoRef.current.srcObject = activePeerStream;
-        }
-      }
+    if (participant.videoEnabled && participant.stream && videoRef.current) {
+      videoRef.current.srcObject = participant.stream;
     } else if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
+  }, [participant.stream, participant.videoEnabled]);
 
-    return () => {
-      if (activePeerStream && activePeerStream._cleanup) {
-        activePeerStream._cleanup();
-      }
-    };
-  }, [participant.stream, participant.videoEnabled, participant.name, participant.color]);
+  const showVideo = participant.videoEnabled && Boolean(participant.stream);
 
   return (
     <div 
@@ -38,7 +22,7 @@ export default function VideoTile({ participant, isSelf, isPresenter, onPin }) {
       }`}
     >
       {/* Video Stream or Avatar Fallback */}
-      {participant.videoEnabled ? (
+      {showVideo ? (
         <video
           ref={videoRef}
           autoPlay

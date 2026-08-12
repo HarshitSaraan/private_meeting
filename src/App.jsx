@@ -370,14 +370,19 @@ export default function App() {
           setLocalStream(videoStream);
         }
 
-        // Replace track on active PeerJS calls
-        Object.values(peerCallsRef.current).forEach(call => {
-          if (call && call.peerConnection) {
-            const sender = call.peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
-            if (sender) {
-              sender.replaceTrack(newVideoTrack);
-            } else if (localStreamRef.current) {
-              try { call.peerConnection.addTrack(newVideoTrack, localStreamRef.current); } catch (e) {}
+        // Send updated video stream to all active peer connections
+        Object.keys(peerConnsRef.current).forEach(peerId => {
+          if (peerRef.current && localStreamRef.current) {
+            try {
+              const call = peerRef.current.call(peerId, localStreamRef.current);
+              if (call) {
+                peerCallsRef.current[peerId] = call;
+                call.on('stream', (remoteStream) => {
+                  attachRemoteStreamToParticipant(peerId, remoteStream);
+                });
+              }
+            } catch (e) {
+              console.warn('Track call refresh error:', e);
             }
           }
         });
