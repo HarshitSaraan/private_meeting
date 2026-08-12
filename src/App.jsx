@@ -114,11 +114,38 @@ export default function App() {
         return { 
           ...p, 
           stream: remoteStream,
-          videoEnabled: remoteStream.getVideoTracks().some(t => t.enabled) || p.videoEnabled
+          videoEnabled: remoteStream.getVideoTracks().some(t => t.enabled && t.readyState === 'live') || p.videoEnabled
         };
       }
       return p;
     }));
+  };
+
+  // Helper to place or refresh a media call to a specific peer
+  const placeMediaCall = (peerId) => {
+    if (!peerRef.current || !localStreamRef.current) return;
+    // Ensure audio tracks respect current mic state
+    localStreamRef.current.getAudioTracks().forEach(t => {
+      t.enabled = micEnabledRef.current;
+    });
+    try {
+      const call = peerRef.current.call(peerId, localStreamRef.current);
+      if (call) {
+        peerCallsRef.current[peerId] = call;
+        call.on('stream', (remoteStream) => {
+          attachRemoteStreamToParticipant(peerId, remoteStream);
+        });
+      }
+    } catch (err) {
+      console.warn('Media call error:', err);
+    }
+  };
+
+  // Helper to re-call all connected peers (refreshes WebRTC media)
+  const refreshAllMediaCalls = () => {
+    Object.keys(peerConnsRef.current).forEach(peerId => {
+      placeMediaCall(peerId);
+    });
   };
 
   // Unified Signal Message Processor
@@ -149,24 +176,9 @@ export default function App() {
         setKnockingState('none');
         enterMeetingRoom(data.config, data.existingParticipants || []);
 
-        // Initiate PeerJS WebRTC Call to Host if Host Peer ID was provided
-        if (data.hostPeerId && peerRef.current && localStreamRef.current) {
-          // Ensure audio tracks respect current mic state before calling
-          localStreamRef.current.getAudioTracks().forEach(t => {
-            t.enabled = micEnabledRef.current;
-          });
-          try {
-            const call = peerRef.current.call(data.hostPeerId, localStreamRef.current);
-            if (call) {
-              peerCallsRef.current[data.hostPeerId] = call;
-              call.on('stream', (remoteStream) => {
-                attachRemoteStreamToParticipant(data.hostPeerId, remoteStream);
-              });
-            }
-          } catch (err) {
-            console.warn('Call creation error:', err);
-          }
-        }
+        // Client does NOT place a call to host here.
+        // Only the HOST initiates media calls (in handleAdmitUser) to avoid duplicate
+        // competing WebRTC connections that orphan each other.
       }
     }
 
@@ -335,8 +347,10 @@ export default function App() {
     setMicEnabled(nextMicState);
 
     if (!localStreamRef.current) {
-      // No stream yet — acquire one (mic will be enabled since nextMicState is true)
+      // No stream yet — acquire one
       await requestMediaPermissions(videoEnabled, nextMicState);
+      // After acquiring, refresh media calls so peers get the stream
+      refreshAllMediaCalls();
     } else {
       // Mute/unmute existing audio tracks
       localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = nextMicState; });
@@ -366,7 +380,6 @@ export default function App() {
         const newVideoTrack = videoStream.getVideoTracks()[0];
 
         if (localStreamRef.current) {
-          // Remove any old video tracks and add the new one
           localStreamRef.current.getVideoTracks().forEach(t => t.stop());
           localStreamRef.current.addTrack(newVideoTrack);
         } else {
@@ -381,20 +394,8 @@ export default function App() {
           });
         }
 
-        // Replace video track on EXISTING peer calls (don't create new calls)
-        Object.values(peerCallsRef.current).forEach(call => {
-          if (call && call.peerConnection) {
-            const sender = call.peerConnection.getSenders().find(s => s.track?.kind === 'video' || (s.track === null && s !== call.peerConnection.getSenders().find(ss => ss.track?.kind === 'audio')));
-            if (sender) {
-              sender.replaceTrack(newVideoTrack).catch(() => {});
-            } else {
-              // No video sender exists yet — add one
-              try {
-                call.peerConnection.addTrack(newVideoTrack, localStreamRef.current);
-              } catch (e) {}
-            }
-          }
-        });
+        // Re-call all peers with the updated stream (audio+video)
+        refreshAllMediaCalls();
       } catch (err) {
         console.warn('Camera access error:', err);
         setVideoEnabled(false);
@@ -403,21 +404,13 @@ export default function App() {
     } else {
       // Turn Camera OFF: Stop video tracks to release hardware LED
       if (localStreamRef.current) {
-        const videoTracks = localStreamRef.current.getVideoTracks();
-        videoTracks.forEach(t => {
-          // Replace the video sender with null on existing calls to keep audio alive
-          Object.values(peerCallsRef.current).forEach(call => {
-            if (call && call.peerConnection) {
-              const sender = call.peerConnection.getSenders().find(s => s.track === t);
-              if (sender) {
-                sender.replaceTrack(null).catch(() => {});
-              }
-            }
-          });
+        localStreamRef.current.getVideoTracks().forEach(t => {
           t.stop();
           localStreamRef.current.removeTrack(t);
         });
       }
+      // Re-call all peers with audio-only stream so audio stays alive
+      refreshAllMediaCalls();
     }
 
     setParticipants(prev => prev.map(p => {
@@ -675,23 +668,9 @@ export default function App() {
       existingParticipants: hostParticipantList
     });
 
-    // Initiate WebRTC Call to Admitted Peer if peerId present
-    if (request.peerId && peerRef.current && localStreamRef.current) {
-      // Ensure audio tracks respect current mic state before calling
-      localStreamRef.current.getAudioTracks().forEach(t => {
-        t.enabled = micEnabledRef.current;
-      });
-      try {
-        const call = peerRef.current.call(request.peerId, localStreamRef.current);
-        if (call) {
-          peerCallsRef.current[request.peerId] = call;
-          call.on('stream', (remoteStream) => {
-            attachRemoteStreamToParticipant(request.peerId, remoteStream);
-          });
-        }
-      } catch (err) {
-        console.warn('Host call placement error:', err);
-      }
+    // Initiate WebRTC Call to Admitted Peer
+    if (request.peerId) {
+      placeMediaCall(request.peerId);
     }
 
     broadcastSignal({
