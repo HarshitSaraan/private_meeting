@@ -58,13 +58,17 @@ export function isValidMeetingCode(code) {
   if (!code) return false;
   const cleanCode = code.trim().toLowerCase();
   
-  // Check active rooms
+  // Check active rooms in local storage
   const activeRooms = getActiveRooms();
   if (activeRooms[cleanCode]) return true;
 
-  // Check scheduled meetings
+  // Check scheduled meetings in local storage
   const scheduled = getScheduledMeetings();
   if (scheduled.some(s => s.code.toLowerCase() === cleanCode)) return true;
+
+  // Allow any properly formatted room code (alphanumeric/hyphenated string, min length 4)
+  const roomCodeRegex = /^[a-z0-9-]{4,20}$/;
+  if (roomCodeRegex.test(cleanCode)) return true;
 
   return false;
 }

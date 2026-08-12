@@ -1,16 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
-import Navbar from './components/Navbar';
-import HomeLobby from './components/HomeLobby';
-import ScheduleModal from './components/ScheduleModal';
-import VideoGrid from './components/VideoGrid';
-import ControlBar from './components/ControlBar';
-import WhiteboardModal from './components/WhiteboardModal';
-import ChatDrawer from './components/ChatDrawer';
-import PeopleDrawer from './components/PeopleDrawer';
-import RecordingBanner from './components/RecordingBanner';
-import { useRecorder } from './hooks/useRecorder';
-import { getScheduledMeetings, deleteScheduledMeeting, getUserProfile, saveUserProfile } from './utils/storage';
-import { UserCheck, Check, X, Clock, ArrowLeft } from 'lucide-react';
+import Peer from 'peerjs';
 
 export default function App() {
   // Navigation & Room State
@@ -27,7 +15,7 @@ export default function App() {
 
   // Knocking / Host Admission System State
   const [knockingState, setKnockingState] = useState('none'); // 'none' | 'waiting' | 'declined'
-  const [knockRequests, setKnockRequests] = useState([]); // [{ userId, userName, roomCode }]
+  const [knockRequests, setKnockRequests] = useState([]); // [{ userId, userName, roomCode, peerId }]
 
   // In-Meeting Media State
   const [localStream, setLocalStream] = useState(null);
@@ -57,6 +45,11 @@ export default function App() {
 
   const localStreamRef = useRef(null);
   const broadcastChannelRef = useRef(null);
+
+  // PeerJS Cross-Device WebRTC Signaling Refs
+  const peerRef = useRef(null);
+  const peerConnsRef = useRef({}); // { [peerId]: DataConnection }
+  const peerCallsRef = useRef({}); // { [peerId]: MediaCall }
   
   // Mutable refs for channel handlers to access latest state without re-subscribing
   const meetingInfoRef = useRef(meetingInfo);
@@ -70,101 +63,180 @@ export default function App() {
   const userNameRef = useRef(userProfile?.name || 'User');
   userNameRef.current = userProfile?.name || 'User';
 
-  // Setup BroadcastChannel for Real-Time Multi-Tab / Multi-Device Communication
+  // Universal Signal Broadcaster (BroadcastChannel + PeerJS Data Connections)
+  const broadcastSignal = (msg) => {
+    if (broadcastChannelRef.current) {
+      try {
+        broadcastChannelRef.current.postMessage(msg);
+      } catch (e) {}
+    }
+    Object.values(peerConnsRef.current).forEach((conn) => {
+      if (conn && conn.open) {
+        try {
+          conn.send(msg);
+        } catch (e) {}
+      }
+    });
+  };
+
+  // Unified Signal Message Processor
+  const handleSignalMessage = (data) => {
+    if (!data || !data.type) return;
+
+    const currentRoomCode = meetingInfoRef.current?.code;
+    const myId = sessionUserIdRef.current;
+
+    // 1. Host receives Admission Request from joining peer (local tab or remote intern device)
+    if (data.type === 'KNOCK_REQUEST') {
+      if (currentRoomCode === data.roomCode && isAdminRef.current) {
+        setKnockRequests(prev => {
+          if (prev.some(r => r.userId === data.userId)) return prev;
+          return [...prev, { 
+            userId: data.userId, 
+            userName: data.userName, 
+            roomCode: data.roomCode,
+            peerId: data.peerId
+          }];
+        });
+      }
+    }
+
+    // 2. Joining user receives Acceptance from Host
+    if (data.type === 'KNOCK_ACCEPTED') {
+      if (data.targetUserId === myId) {
+        setKnockingState('none');
+        enterMeetingRoom(data.config, data.existingParticipants || []);
+
+        // Initiate PeerJS WebRTC Call to Host if Host Peer ID was provided
+        if (data.hostPeerId && peerRef.current && localStreamRef.current) {
+          try {
+            const call = peerRef.current.call(data.hostPeerId, localStreamRef.current);
+            if (call) {
+              peerCallsRef.current[data.hostPeerId] = call;
+              call.on('stream', (remoteStream) => {
+                setParticipants(prev => prev.map(p => {
+                  if (p.id === data.hostPeerId || p.isAdmin) {
+                    return { ...p, stream: remoteStream };
+                  }
+                  return p;
+                }));
+              });
+            }
+          } catch (err) {
+            console.warn('Call creation error:', err);
+          }
+        }
+      }
+    }
+
+    // 3. Joining user receives Decline from Host
+    if (data.type === 'KNOCK_DECLINED') {
+      if (data.targetUserId === myId) {
+        setKnockingState('declined');
+      }
+    }
+
+    // 4. Peer Joined Announcement
+    if (data.type === 'PEER_JOINED') {
+      if (currentRoomCode === data.roomCode && data.peer.id !== myId) {
+        setParticipants(prev => {
+          if (prev.some(p => p.id === data.peer.id)) {
+            return prev.map(p => p.id === data.peer.id ? { ...p, ...data.peer, isSelf: false } : p);
+          }
+          return [...prev, { ...data.peer, isSelf: false }];
+        });
+      }
+    }
+
+    // 5. Peer Left Announcement
+    if (data.type === 'PEER_LEFT') {
+      if (currentRoomCode === data.roomCode) {
+        setParticipants(prev => prev.filter(p => p.id !== data.userId));
+        if (peerCallsRef.current[data.userId]) {
+          try { peerCallsRef.current[data.userId].close(); } catch (e) {}
+          delete peerCallsRef.current[data.userId];
+        }
+        if (peerConnsRef.current[data.userId]) {
+          try { peerConnsRef.current[data.userId].close(); } catch (e) {}
+          delete peerConnsRef.current[data.userId];
+        }
+      }
+    }
+
+    // 6. Peer Status Update (Mic / Video / Hand Toggle)
+    if (data.type === 'PEER_STATUS_UPDATE') {
+      if (currentRoomCode === data.roomCode && data.userId !== myId) {
+        setParticipants(prev => prev.map(p => {
+          if (p.id === data.userId) {
+            return { 
+              ...p, 
+              micEnabled: data.micEnabled, 
+              videoEnabled: data.videoEnabled, 
+              handRaised: data.handRaised 
+            };
+          }
+          return p;
+        }));
+      }
+    }
+
+    // 7. Chat Message Broadcast
+    if (data.type === 'CHAT_MESSAGE') {
+      if (currentRoomCode === data.roomCode && data.senderId !== myId) {
+        setChatMessages(prev => [
+          ...prev,
+          {
+            id: data.msg.id,
+            sender: data.msg.sender,
+            text: data.msg.text,
+            time: data.msg.time,
+            isSelf: false
+          }
+        ]);
+        setUnreadChatCount(prev => prev + 1);
+      }
+    }
+
+    // 8. Admin Mute All Command
+    if (data.type === 'ADMIN_MUTE_ALL') {
+      if (currentRoomCode === data.roomCode && !isAdminRef.current) {
+        setMicEnabled(false);
+        if (localStreamRef.current) {
+          localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = false; });
+        }
+      }
+    }
+
+    // 9. Sync Request
+    if (data.type === 'REQUEST_SYNC') {
+      if (currentRoomCode === data.roomCode && inMeetingRef.current) {
+        const selfP = participantsRef.current.find(p => p.isSelf);
+        if (selfP) {
+          broadcastSignal({
+            type: 'PEER_JOINED',
+            roomCode: currentRoomCode,
+            peer: {
+              id: myId,
+              name: selfP.name,
+              isAdmin: selfP.isAdmin,
+              micEnabled: selfP.micEnabled,
+              videoEnabled: selfP.videoEnabled,
+              handRaised: selfP.handRaised,
+              color: selfP.color || '#1a73e8'
+            }
+          });
+        }
+      }
+    }
+  };
+
+  // Setup BroadcastChannel for Same-Device Local Tab Communication
   useEffect(() => {
     const channel = new BroadcastChannel('meet_private_channel');
     broadcastChannelRef.current = channel;
 
     channel.onmessage = (event) => {
-      const data = event.data;
-      if (!data || !data.type) return;
-
-      const currentRoomCode = meetingInfoRef.current?.code;
-      const myId = sessionUserIdRef.current;
-
-      // 1. Host receives Admission Request from joining peer
-      if (data.type === 'KNOCK_REQUEST') {
-        if (currentRoomCode === data.roomCode && isAdminRef.current) {
-          setKnockRequests(prev => {
-            if (prev.some(r => r.userId === data.userId)) return prev;
-            return [...prev, { userId: data.userId, userName: data.userName, roomCode: data.roomCode }];
-          });
-        }
-      }
-
-      // 2. Joining user receives Acceptance from Host
-      if (data.type === 'KNOCK_ACCEPTED') {
-        if (data.targetUserId === myId) {
-          setKnockingState('none');
-          // Enter room with all existing participants passed by host
-          enterMeetingRoom(data.config, data.existingParticipants || []);
-        }
-      }
-
-      // 3. Joining user receives Decline from Host
-      if (data.type === 'KNOCK_DECLINED') {
-        if (data.targetUserId === myId) {
-          setKnockingState('declined');
-        }
-      }
-
-      // 4. Peer Joined Announcement
-      if (data.type === 'PEER_JOINED') {
-        if (currentRoomCode === data.roomCode && data.peer.id !== myId) {
-          setParticipants(prev => {
-            if (prev.some(p => p.id === data.peer.id)) {
-              return prev.map(p => p.id === data.peer.id ? { ...p, ...data.peer, isSelf: false } : p);
-            }
-            return [...prev, { ...data.peer, isSelf: false }];
-          });
-        }
-      }
-
-      // 5. Peer Left Announcement
-      if (data.type === 'PEER_LEFT') {
-        if (currentRoomCode === data.roomCode) {
-          setParticipants(prev => prev.filter(p => p.id !== data.userId));
-        }
-      }
-
-      // 6. Peer Status Update (Mic / Video / Hand Toggle)
-      if (data.type === 'PEER_STATUS_UPDATE') {
-        if (currentRoomCode === data.roomCode && data.userId !== myId) {
-          setParticipants(prev => prev.map(p => {
-            if (p.id === data.userId) {
-              return { 
-                ...p, 
-                micEnabled: data.micEnabled, 
-                videoEnabled: data.videoEnabled, 
-                handRaised: data.handRaised 
-              };
-            }
-            return p;
-          }));
-        }
-      }
-
-      // 7. Sync Request: Active peers announce themselves when requested
-      if (data.type === 'REQUEST_SYNC') {
-        if (currentRoomCode === data.roomCode && inMeetingRef.current) {
-          const selfP = participantsRef.current.find(p => p.isSelf);
-          if (selfP) {
-            channel.postMessage({
-              type: 'PEER_JOINED',
-              roomCode: currentRoomCode,
-              peer: {
-                id: myId,
-                name: selfP.name,
-                isAdmin: selfP.isAdmin,
-                micEnabled: selfP.micEnabled,
-                videoEnabled: selfP.videoEnabled,
-                handRaised: selfP.handRaised,
-                color: selfP.color || '#1a73e8'
-              }
-            });
-          }
-        }
-      }
+      handleSignalMessage(event.data);
     };
 
     return () => {
@@ -234,8 +306,8 @@ export default function App() {
   };
 
   const broadcastStatusChange = (mic, vid, hand) => {
-    if (broadcastChannelRef.current && meetingInfo) {
-      broadcastChannelRef.current.postMessage({
+    if (meetingInfo) {
+      broadcastSignal({
         type: 'PEER_STATUS_UPDATE',
         roomCode: meetingInfo.code,
         userId: sessionUserIdRef.current,
@@ -248,18 +320,102 @@ export default function App() {
 
   // Start / Join Flow Trigger
   const handleStartMeeting = async (config) => {
+    const cleanCode = config.code.trim().toLowerCase();
+    const myId = sessionUserIdRef.current;
+
+    // Clean up any existing peer instance before starting new room
+    if (peerRef.current) {
+      try { peerRef.current.destroy(); } catch (e) {}
+      peerRef.current = null;
+    }
+
     if (config.isOwner || config.isAdmin) {
+      // Host Flow: Register Host Peer ID on PeerJS Cloud (e.g. meet-host-xxx-yyyy-zzz)
+      const hostPeerId = `meet-host-${cleanCode}`;
+      try {
+        const peer = new Peer(hostPeerId, {
+          debug: 1,
+          config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
+        });
+        peerRef.current = peer;
+
+        peer.on('connection', (conn) => {
+          peerConnsRef.current[conn.peer] = conn;
+          conn.on('data', (data) => handleSignalMessage(data));
+        });
+
+        peer.on('call', (call) => {
+          call.answer(localStreamRef.current);
+          peerCallsRef.current[call.peer] = call;
+          call.on('stream', (remoteStream) => {
+            setParticipants(prev => prev.map(p => {
+              if (p.id === call.peer || p.peerId === call.peer) {
+                return { ...p, stream: remoteStream };
+              }
+              return p;
+            }));
+          });
+        });
+      } catch (err) {
+        console.warn('PeerJS Host Init Warning:', err);
+      }
+
       enterMeetingRoom(config);
     } else {
+      // Participant Flow: Request Admission from Host
       setMeetingInfo(config);
       setKnockingState('waiting');
 
+      const clientPeerId = `meet-peer-${cleanCode}-${myId}`;
+      try {
+        const peer = new Peer(clientPeerId, {
+          debug: 1,
+          config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
+        });
+        peerRef.current = peer;
+
+        peer.on('open', () => {
+          const hostPeerId = `meet-host-${cleanCode}`;
+          const conn = peer.connect(hostPeerId);
+          if (conn) {
+            peerConnsRef.current[hostPeerId] = conn;
+            conn.on('open', () => {
+              conn.send({
+                type: 'KNOCK_REQUEST',
+                roomCode: cleanCode,
+                userId: myId,
+                userName: config.userName,
+                peerId: clientPeerId
+              });
+            });
+            conn.on('data', (data) => handleSignalMessage(data));
+          }
+        });
+
+        peer.on('call', (call) => {
+          call.answer(localStreamRef.current);
+          peerCallsRef.current[call.peer] = call;
+          call.on('stream', (remoteStream) => {
+            setParticipants(prev => prev.map(p => {
+              if (p.id === call.peer || p.peerId === call.peer) {
+                return { ...p, stream: remoteStream };
+              }
+              return p;
+            }));
+          });
+        });
+      } catch (err) {
+        console.warn('PeerJS Client Init Warning:', err);
+      }
+
+      // Also trigger BroadcastChannel KNOCK_REQUEST for local tab testing
       if (broadcastChannelRef.current) {
         broadcastChannelRef.current.postMessage({
           type: 'KNOCK_REQUEST',
-          roomCode: config.code,
-          userId: sessionUserIdRef.current,
-          userName: config.userName
+          roomCode: cleanCode,
+          userId: myId,
+          userName: config.userName,
+          peerId: clientPeerId
         });
       }
     }
@@ -280,10 +436,9 @@ export default function App() {
       handRaised: false,
       isSpeaking: false,
       color: '#1a73e8',
-      stream: null
+      stream: localStreamRef.current
     };
 
-    // Format existing peers received from host
     const sanitizedPeers = initialPeers
       .filter(p => p.id !== myId)
       .map(p => ({
@@ -294,46 +449,43 @@ export default function App() {
     setParticipants([selfUser, ...sanitizedPeers]);
     setInMeeting(true);
 
-    // Broadcast PEER_JOINED to existing participants in room
-    if (broadcastChannelRef.current) {
-      broadcastChannelRef.current.postMessage({
-        type: 'PEER_JOINED',
-        roomCode: config.code,
-        peer: {
-          id: selfUser.id,
-          name: selfUser.name,
-          isAdmin: selfUser.isAdmin,
-          micEnabled: false,
-          videoEnabled: false,
-          handRaised: false,
-          color: '#34a853'
-        }
-      });
+    broadcastSignal({
+      type: 'PEER_JOINED',
+      roomCode: config.code,
+      peer: {
+        id: selfUser.id,
+        name: selfUser.name,
+        isAdmin: selfUser.isAdmin,
+        micEnabled: false,
+        videoEnabled: false,
+        handRaised: false,
+        color: '#34a853'
+      }
+    });
 
-      // Request all active peers in room to sync their presence
-      broadcastChannelRef.current.postMessage({
-        type: 'REQUEST_SYNC',
-        roomCode: config.code
-      });
-    }
+    broadcastSignal({
+      type: 'REQUEST_SYNC',
+      roomCode: config.code
+    });
 
     setChatMessages([
       {
         id: 'msg_welcome',
         sender: 'System',
-        text: `Joined ${config.title || 'Meeting'}. Private & secure session.`,
+        text: `Joined ${config.title || 'Meeting'}. Private & secure session across all devices.`,
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         isSelf: false
       }
     ]);
   };
 
-  // Host Action: Admit User (Sends Host + all current participants to joining peer)
+  // Host Action: Admit User
   const handleAdmitUser = (request) => {
     setKnockRequests(prev => prev.filter(r => r.userId !== request.userId));
 
     const newPeer = {
       id: request.userId,
+      peerId: request.peerId,
       name: request.userName,
       isSelf: false,
       isAdmin: false,
@@ -344,13 +496,11 @@ export default function App() {
       color: '#34a853'
     };
 
-    // Add admitted user to host's own participant state
     setParticipants(prev => {
       if (prev.some(p => p.id === newPeer.id)) return prev;
       return [...prev, newPeer];
     });
 
-    // Prepare complete list of current participants to send to joining user
     const hostParticipantList = participantsRef.current.map(p => ({
       id: p.id,
       name: p.name,
@@ -361,47 +511,62 @@ export default function App() {
       color: p.color || '#1a73e8'
     }));
 
-    // Send Acceptance Broadcast directly to joining user
-    if (broadcastChannelRef.current) {
-      broadcastChannelRef.current.postMessage({
-        type: 'KNOCK_ACCEPTED',
-        roomCode: request.roomCode,
-        targetUserId: request.userId,
-        config: {
-          code: request.roomCode,
-          title: `Meeting (${request.roomCode})`,
-          isAdmin: false,
-          isOwner: false,
-          userName: request.userName,
-          micInitial: false,
-          videoInitial: false
-        },
-        existingParticipants: hostParticipantList
-      });
+    // Send Acceptance Broadcast to joining peer
+    broadcastSignal({
+      type: 'KNOCK_ACCEPTED',
+      roomCode: request.roomCode,
+      targetUserId: request.userId,
+      hostPeerId: peerRef.current?.id,
+      config: {
+        code: request.roomCode,
+        title: `Meeting (${request.roomCode})`,
+        isAdmin: false,
+        isOwner: false,
+        userName: request.userName,
+        micInitial: false,
+        videoInitial: false
+      },
+      existingParticipants: hostParticipantList
+    });
 
-      // Broadcast PEER_JOINED to any other participants in the room
-      broadcastChannelRef.current.postMessage({
-        type: 'PEER_JOINED',
-        roomCode: request.roomCode,
-        peer: newPeer
-      });
+    // Initiate WebRTC Call to Admitted Peer if peerId present
+    if (request.peerId && peerRef.current) {
+      try {
+        const call = peerRef.current.call(request.peerId, localStreamRef.current);
+        if (call) {
+          peerCallsRef.current[request.peerId] = call;
+          call.on('stream', (remoteStream) => {
+            setParticipants(prev => prev.map(p => {
+              if (p.id === request.userId || p.peerId === request.peerId) {
+                return { ...p, stream: remoteStream };
+              }
+              return p;
+            }));
+          });
+        }
+      } catch (err) {
+        console.warn('Host call placement error:', err);
+      }
     }
+
+    broadcastSignal({
+      type: 'PEER_JOINED',
+      roomCode: request.roomCode,
+      peer: newPeer
+    });
   };
 
   // Host Action: Decline User
   const handleDeclineUser = (request) => {
     setKnockRequests(prev => prev.filter(r => r.userId !== request.userId));
-
-    if (broadcastChannelRef.current) {
-      broadcastChannelRef.current.postMessage({
-        type: 'KNOCK_DECLINED',
-        roomCode: request.roomCode,
-        targetUserId: request.userId
-      });
-    }
+    broadcastSignal({
+      type: 'KNOCK_DECLINED',
+      roomCode: request.roomCode,
+      targetUserId: request.userId
+    });
   };
 
-  // User Leaves Meeting -> Broadcast PEER_LEFT so all participants immediately update list
+  // User Leaves Meeting
   const handleLeaveMeeting = () => {
     if (isRecording) stopRecording();
     if (screenShareStream) {
@@ -413,12 +578,28 @@ export default function App() {
       localStreamRef.current = null;
     }
 
-    if (broadcastChannelRef.current && meetingInfo) {
-      broadcastChannelRef.current.postMessage({
+    if (meetingInfo) {
+      broadcastSignal({
         type: 'PEER_LEFT',
         roomCode: meetingInfo.code,
         userId: sessionUserIdRef.current
       });
+    }
+
+    // Clean up PeerJS connections
+    Object.values(peerCallsRef.current).forEach(call => {
+      try { call.close(); } catch (e) {}
+    });
+    peerCallsRef.current = {};
+
+    Object.values(peerConnsRef.current).forEach(conn => {
+      try { conn.close(); } catch (e) {}
+    });
+    peerConnsRef.current = {};
+
+    if (peerRef.current) {
+      try { peerRef.current.destroy(); } catch (e) {}
+      peerRef.current = null;
     }
 
     setLocalStream(null);
@@ -471,6 +652,15 @@ export default function App() {
       isSelf: true
     };
     setChatMessages(prev => [...prev, newMsg]);
+
+    if (meetingInfo) {
+      broadcastSignal({
+        type: 'CHAT_MESSAGE',
+        roomCode: meetingInfo.code,
+        senderId: sessionUserIdRef.current,
+        msg: newMsg
+      });
+    }
   };
 
   const handleAdminMuteAll = () => {
@@ -480,6 +670,13 @@ export default function App() {
       }
       return p;
     }));
+
+    if (meetingInfo) {
+      broadcastSignal({
+        type: 'ADMIN_MUTE_ALL',
+        roomCode: meetingInfo.code
+      });
+    }
   };
 
   const handleAdminToggleChatDisable = () => {
