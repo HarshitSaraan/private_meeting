@@ -83,6 +83,8 @@ export default function App() {
   participantsRef.current = participants;
   const userNameRef = useRef(userProfile?.name || 'User');
   userNameRef.current = userProfile?.name || 'User';
+  const micEnabledRef = useRef(micEnabled);
+  micEnabledRef.current = micEnabled;
 
   // Universal Signal Broadcaster (BroadcastChannel + PeerJS Data Connections)
   const broadcastSignal = (msg) => {
@@ -298,6 +300,10 @@ export default function App() {
       localStreamRef.current = stream;
       setLocalStream(stream);
 
+      // Sync React state with what was actually acquired from hardware
+      setMicEnabled(requestAudio);
+      setVideoEnabled(requestVideo);
+
       // Update local participant stream
       setParticipants(prev => prev.map(p => {
         if (p.isSelf) {
@@ -368,6 +374,13 @@ export default function App() {
         } else {
           localStreamRef.current = videoStream;
           setLocalStream(videoStream);
+        }
+
+        // Ensure audio tracks respect current mic state before sending to peers
+        if (localStreamRef.current) {
+          localStreamRef.current.getAudioTracks().forEach(t => {
+            t.enabled = micEnabled;
+          });
         }
 
         // Send updated video stream to all active peer connections
@@ -466,6 +479,12 @@ export default function App() {
           });
 
           peer.on('call', (call) => {
+            // Ensure audio tracks respect current mic state before answering
+            if (localStreamRef.current) {
+              localStreamRef.current.getAudioTracks().forEach(t => {
+                t.enabled = micEnabledRef.current;
+              });
+            }
             call.answer(localStreamRef.current);
             peerCallsRef.current[call.peer] = call;
             call.on('stream', (remoteStream) => {
@@ -512,6 +531,12 @@ export default function App() {
           });
 
           peer.on('call', (call) => {
+            // Ensure audio tracks respect current mic state before answering
+            if (localStreamRef.current) {
+              localStreamRef.current.getAudioTracks().forEach(t => {
+                t.enabled = micEnabledRef.current;
+              });
+            }
             call.answer(localStreamRef.current);
             peerCallsRef.current[call.peer] = call;
             call.on('stream', (remoteStream) => {
