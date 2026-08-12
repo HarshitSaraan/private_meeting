@@ -151,6 +151,10 @@ export default function App() {
 
         // Initiate PeerJS WebRTC Call to Host if Host Peer ID was provided
         if (data.hostPeerId && peerRef.current && localStreamRef.current) {
+          // Ensure audio tracks respect current mic state before calling
+          localStreamRef.current.getAudioTracks().forEach(t => {
+            t.enabled = micEnabledRef.current;
+          });
           try {
             const call = peerRef.current.call(data.hostPeerId, localStreamRef.current);
             if (call) {
@@ -283,14 +287,20 @@ export default function App() {
   }, []);
 
   // Request browser hardware permissions and capture live stream
-  const requestMediaPermissions = async (requestVideo = false, requestAudio = true) => {
+  // Always acquires audio (for WebRTC readiness) but mutes track if mic should be OFF
+  const requestMediaPermissions = async (requestVideo = false, micShouldBeOn = false) => {
     try {
       const constraints = {
         video: requestVideo ? { width: { ideal: 1280 }, height: { ideal: 720 } } : false,
-        audio: requestAudio
+        audio: true // Always acquire audio so WebRTC has an audio track to negotiate
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+      // Immediately mute audio track if mic should be OFF
+      stream.getAudioTracks().forEach(t => {
+        t.enabled = micShouldBeOn;
+      });
 
       // Stop previous video tracks if video is not requested to release camera hardware
       if (!requestVideo && localStreamRef.current) {
@@ -300,32 +310,17 @@ export default function App() {
       localStreamRef.current = stream;
       setLocalStream(stream);
 
-      // Sync React state with what was actually acquired from hardware
-      setMicEnabled(requestAudio);
+      // Sync React state
+      setMicEnabled(micShouldBeOn);
       setVideoEnabled(requestVideo);
 
       // Update local participant stream
       setParticipants(prev => prev.map(p => {
         if (p.isSelf) {
-          return { ...p, stream, videoEnabled: requestVideo, micEnabled: requestAudio };
+          return { ...p, stream, videoEnabled: requestVideo, micEnabled: micShouldBeOn };
         }
         return p;
       }));
-
-      // Dynamically attach acquired tracks to active peer calls
-      Object.values(peerCallsRef.current).forEach(call => {
-        if (call && call.peerConnection) {
-          const senders = call.peerConnection.getSenders();
-          stream.getTracks().forEach(track => {
-            const sender = senders.find(s => s.track && s.track.kind === track.kind);
-            if (sender) {
-              sender.replaceTrack(track);
-            } else {
-              try { call.peerConnection.addTrack(track, stream); } catch (e) {}
-            }
-          });
-        }
-      });
 
       return stream;
     } catch (err) {
@@ -339,9 +334,11 @@ export default function App() {
     const nextMicState = !micEnabled;
     setMicEnabled(nextMicState);
 
-    if (nextMicState && !localStreamRef.current) {
-      await requestMediaPermissions(videoEnabled, true);
-    } else if (localStreamRef.current) {
+    if (!localStreamRef.current) {
+      // No stream yet — acquire one (mic will be enabled since nextMicState is true)
+      await requestMediaPermissions(videoEnabled, nextMicState);
+    } else {
+      // Mute/unmute existing audio tracks
       localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = nextMicState; });
     }
 
@@ -361,7 +358,7 @@ export default function App() {
     setVideoEnabled(nextVideoState);
 
     if (nextVideoState) {
-      // Turn Camera ON: Acquire video stream and attach track
+      // Turn Camera ON: Acquire a fresh video track
       try {
         const videoStream = await navigator.mediaDevices.getUserMedia({
           video: { width: { ideal: 1280 }, height: { ideal: 720 } }
@@ -369,6 +366,7 @@ export default function App() {
         const newVideoTrack = videoStream.getVideoTracks()[0];
 
         if (localStreamRef.current) {
+          // Remove any old video tracks and add the new one
           localStreamRef.current.getVideoTracks().forEach(t => t.stop());
           localStreamRef.current.addTrack(newVideoTrack);
         } else {
@@ -376,26 +374,24 @@ export default function App() {
           setLocalStream(videoStream);
         }
 
-        // Ensure audio tracks respect current mic state before sending to peers
+        // Ensure audio tracks still respect current mic state
         if (localStreamRef.current) {
           localStreamRef.current.getAudioTracks().forEach(t => {
             t.enabled = micEnabled;
           });
         }
 
-        // Send updated video stream to all active peer connections
-        Object.keys(peerConnsRef.current).forEach(peerId => {
-          if (peerRef.current && localStreamRef.current) {
-            try {
-              const call = peerRef.current.call(peerId, localStreamRef.current);
-              if (call) {
-                peerCallsRef.current[peerId] = call;
-                call.on('stream', (remoteStream) => {
-                  attachRemoteStreamToParticipant(peerId, remoteStream);
-                });
-              }
-            } catch (e) {
-              console.warn('Track call refresh error:', e);
+        // Replace video track on EXISTING peer calls (don't create new calls)
+        Object.values(peerCallsRef.current).forEach(call => {
+          if (call && call.peerConnection) {
+            const sender = call.peerConnection.getSenders().find(s => s.track?.kind === 'video' || (s.track === null && s !== call.peerConnection.getSenders().find(ss => ss.track?.kind === 'audio')));
+            if (sender) {
+              sender.replaceTrack(newVideoTrack).catch(() => {});
+            } else {
+              // No video sender exists yet — add one
+              try {
+                call.peerConnection.addTrack(newVideoTrack, localStreamRef.current);
+              } catch (e) {}
             }
           }
         });
@@ -405,9 +401,19 @@ export default function App() {
         return;
       }
     } else {
-      // Turn Camera OFF: STOP video track completely to turn off physical camera LED light
+      // Turn Camera OFF: Stop video tracks to release hardware LED
       if (localStreamRef.current) {
-        localStreamRef.current.getVideoTracks().forEach(t => {
+        const videoTracks = localStreamRef.current.getVideoTracks();
+        videoTracks.forEach(t => {
+          // Replace the video sender with null on existing calls to keep audio alive
+          Object.values(peerCallsRef.current).forEach(call => {
+            if (call && call.peerConnection) {
+              const sender = call.peerConnection.getSenders().find(s => s.track === t);
+              if (sender) {
+                sender.replaceTrack(null).catch(() => {});
+              }
+            }
+          });
           t.stop();
           localStreamRef.current.removeTrack(t);
         });
@@ -456,9 +462,9 @@ export default function App() {
       peerRef.current = null;
     }
 
-    // Auto-request local hardware stream if initial permissions set
-    if (!localStreamRef.current && (config.videoInitial || config.micInitial)) {
-      await requestMediaPermissions(config.videoInitial ?? true, config.micInitial ?? true);
+    // Always acquire audio stream on join (mic starts muted, track exists for WebRTC)
+    if (!localStreamRef.current) {
+      await requestMediaPermissions(config.videoInitial ?? false, config.micInitial ?? false);
     }
 
     if (config.isOwner || config.isAdmin) {
@@ -670,7 +676,11 @@ export default function App() {
     });
 
     // Initiate WebRTC Call to Admitted Peer if peerId present
-    if (request.peerId && peerRef.current) {
+    if (request.peerId && peerRef.current && localStreamRef.current) {
+      // Ensure audio tracks respect current mic state before calling
+      localStreamRef.current.getAudioTracks().forEach(t => {
+        t.enabled = micEnabledRef.current;
+      });
       try {
         const call = peerRef.current.call(request.peerId, localStreamRef.current);
         if (call) {
@@ -760,6 +770,12 @@ export default function App() {
     }
 
     try {
+      // Check if screen sharing is supported (iOS Safari does not support getDisplayMedia)
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        alert('Screen sharing is not supported on this device/browser. Try using Chrome or Edge on desktop.');
+        return;
+      }
+
       const displayStream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
         audio: true

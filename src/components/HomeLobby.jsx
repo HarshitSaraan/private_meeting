@@ -41,7 +41,7 @@ export default function HomeLobby({
       isAdmin: true, // Creator is Host
       isOwner: true,
       userName: userName.trim(),
-      micInitial: true,
+      micInitial: false,
       videoInitial: false
     });
   };
@@ -71,7 +71,7 @@ export default function HomeLobby({
       isAdmin: false, // Participant requesting to join
       isOwner: false,
       userName: userName.trim(),
-      micInitial: true,
+      micInitial: false,
       videoInitial: false
     });
   };
@@ -87,7 +87,7 @@ export default function HomeLobby({
       isOwner: true,
       userName: userName.trim(),
       passcode: meeting.passcode,
-      micInitial: true,
+      micInitial: false,
       videoInitial: false
     });
   };
