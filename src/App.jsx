@@ -1,4 +1,25 @@
-import Peer from 'peerjs';
+import React, { useState, useEffect, useRef } from 'react';
+import * as PeerModule from 'peerjs';
+import Navbar from './components/Navbar';
+import HomeLobby from './components/HomeLobby';
+import ScheduleModal from './components/ScheduleModal';
+import VideoGrid from './components/VideoGrid';
+import ControlBar from './components/ControlBar';
+import WhiteboardModal from './components/WhiteboardModal';
+import ChatDrawer from './components/ChatDrawer';
+import PeopleDrawer from './components/PeopleDrawer';
+import RecordingBanner from './components/RecordingBanner';
+import { useRecorder } from './hooks/useRecorder';
+import { getScheduledMeetings, deleteScheduledMeeting, getUserProfile, saveUserProfile } from './utils/storage';
+import { UserCheck, Check, X, Clock, ArrowLeft } from 'lucide-react';
+
+const getPeerConstructor = () => {
+  if (typeof window === 'undefined') return null;
+  const PeerClass = PeerModule.Peer || PeerModule.default?.Peer || PeerModule.default || PeerModule;
+  if (typeof PeerClass === 'function') return PeerClass;
+  if (window.Peer) return window.Peer;
+  return null;
+};
 
 export default function App() {
   // Navigation & Room State
@@ -333,29 +354,32 @@ export default function App() {
       // Host Flow: Register Host Peer ID on PeerJS Cloud (e.g. meet-host-xxx-yyyy-zzz)
       const hostPeerId = `meet-host-${cleanCode}`;
       try {
-        const peer = new Peer(hostPeerId, {
-          debug: 1,
-          config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
-        });
-        peerRef.current = peer;
-
-        peer.on('connection', (conn) => {
-          peerConnsRef.current[conn.peer] = conn;
-          conn.on('data', (data) => handleSignalMessage(data));
-        });
-
-        peer.on('call', (call) => {
-          call.answer(localStreamRef.current);
-          peerCallsRef.current[call.peer] = call;
-          call.on('stream', (remoteStream) => {
-            setParticipants(prev => prev.map(p => {
-              if (p.id === call.peer || p.peerId === call.peer) {
-                return { ...p, stream: remoteStream };
-              }
-              return p;
-            }));
+        const PeerClass = getPeerConstructor();
+        if (PeerClass) {
+          const peer = new PeerClass(hostPeerId, {
+            debug: 1,
+            config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
           });
-        });
+          peerRef.current = peer;
+
+          peer.on('connection', (conn) => {
+            peerConnsRef.current[conn.peer] = conn;
+            conn.on('data', (data) => handleSignalMessage(data));
+          });
+
+          peer.on('call', (call) => {
+            call.answer(localStreamRef.current);
+            peerCallsRef.current[call.peer] = call;
+            call.on('stream', (remoteStream) => {
+              setParticipants(prev => prev.map(p => {
+                if (p.id === call.peer || p.peerId === call.peer) {
+                  return { ...p, stream: remoteStream };
+                }
+                return p;
+              }));
+            });
+          });
+        }
       } catch (err) {
         console.warn('PeerJS Host Init Warning:', err);
       }
@@ -368,42 +392,45 @@ export default function App() {
 
       const clientPeerId = `meet-peer-${cleanCode}-${myId}`;
       try {
-        const peer = new Peer(clientPeerId, {
-          debug: 1,
-          config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
-        });
-        peerRef.current = peer;
-
-        peer.on('open', () => {
-          const hostPeerId = `meet-host-${cleanCode}`;
-          const conn = peer.connect(hostPeerId);
-          if (conn) {
-            peerConnsRef.current[hostPeerId] = conn;
-            conn.on('open', () => {
-              conn.send({
-                type: 'KNOCK_REQUEST',
-                roomCode: cleanCode,
-                userId: myId,
-                userName: config.userName,
-                peerId: clientPeerId
-              });
-            });
-            conn.on('data', (data) => handleSignalMessage(data));
-          }
-        });
-
-        peer.on('call', (call) => {
-          call.answer(localStreamRef.current);
-          peerCallsRef.current[call.peer] = call;
-          call.on('stream', (remoteStream) => {
-            setParticipants(prev => prev.map(p => {
-              if (p.id === call.peer || p.peerId === call.peer) {
-                return { ...p, stream: remoteStream };
-              }
-              return p;
-            }));
+        const PeerClass = getPeerConstructor();
+        if (PeerClass) {
+          const peer = new PeerClass(clientPeerId, {
+            debug: 1,
+            config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
           });
-        });
+          peerRef.current = peer;
+
+          peer.on('open', () => {
+            const hostPeerId = `meet-host-${cleanCode}`;
+            const conn = peer.connect(hostPeerId);
+            if (conn) {
+              peerConnsRef.current[hostPeerId] = conn;
+              conn.on('open', () => {
+                conn.send({
+                  type: 'KNOCK_REQUEST',
+                  roomCode: cleanCode,
+                  userId: myId,
+                  userName: config.userName,
+                  peerId: clientPeerId
+                });
+              });
+              conn.on('data', (data) => handleSignalMessage(data));
+            }
+          });
+
+          peer.on('call', (call) => {
+            call.answer(localStreamRef.current);
+            peerCallsRef.current[call.peer] = call;
+            call.on('stream', (remoteStream) => {
+              setParticipants(prev => prev.map(p => {
+                if (p.id === call.peer || p.peerId === call.peer) {
+                  return { ...p, stream: remoteStream };
+                }
+                return p;
+              }));
+            });
+          });
+        }
       } catch (err) {
         console.warn('PeerJS Client Init Warning:', err);
       }
