@@ -14,12 +14,14 @@ export default function VideoTile({ participant, isSelf, isPresenter, onPin }) {
           videoRef.current.srcObject = participant.stream;
         }
       } else {
-        // Generate synthetic video stream for peer so camera is visibly ACTIVE
+        // Generate synthetic video stream for peer so camera indicator renders if media stream unavailable
         activePeerStream = createPeerVideoStream(participant.name, participant.color);
         if (videoRef.current) {
           videoRef.current.srcObject = activePeerStream;
         }
       }
+    } else if (videoRef.current) {
+      videoRef.current.srcObject = null;
     }
 
     return () => {

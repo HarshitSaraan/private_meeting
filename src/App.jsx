@@ -100,6 +100,25 @@ export default function App() {
     });
   };
 
+  // Helper to match incoming WebRTC call peer IDs to room participants
+  const attachRemoteStreamToParticipant = (peerIdOrUserId, remoteStream) => {
+    setParticipants(prev => prev.map(p => {
+      if (
+        p.id === peerIdOrUserId || 
+        p.peerId === peerIdOrUserId || 
+        (peerIdOrUserId && peerIdOrUserId.includes(p.id)) ||
+        (peerIdOrUserId && peerIdOrUserId.startsWith('meet-host-') && p.isAdmin)
+      ) {
+        return { 
+          ...p, 
+          stream: remoteStream,
+          videoEnabled: remoteStream.getVideoTracks().some(t => t.enabled) || p.videoEnabled
+        };
+      }
+      return p;
+    }));
+  };
+
   // Unified Signal Message Processor
   const handleSignalMessage = (data) => {
     if (!data || !data.type) return;
@@ -135,12 +154,7 @@ export default function App() {
             if (call) {
               peerCallsRef.current[data.hostPeerId] = call;
               call.on('stream', (remoteStream) => {
-                setParticipants(prev => prev.map(p => {
-                  if (p.id === data.hostPeerId || p.isAdmin) {
-                    return { ...p, stream: remoteStream };
-                  }
-                  return p;
-                }));
+                attachRemoteStreamToParticipant(data.hostPeerId, remoteStream);
               });
             }
           } catch (err) {
@@ -225,6 +239,7 @@ export default function App() {
         if (localStreamRef.current) {
           localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = false; });
         }
+        setParticipants(prev => prev.map(p => p.isSelf ? { ...p, micEnabled: false } : p));
       }
     }
 
@@ -284,6 +299,21 @@ export default function App() {
         return p;
       }));
 
+      // Dynamically attach acquired tracks to active peer calls
+      Object.values(peerCallsRef.current).forEach(call => {
+        if (call && call.peerConnection) {
+          const senders = call.peerConnection.getSenders();
+          stream.getTracks().forEach(track => {
+            const sender = senders.find(s => s.track && s.track.kind === track.kind);
+            if (sender) {
+              sender.replaceTrack(track);
+            } else {
+              try { call.peerConnection.addTrack(track, stream); } catch (e) {}
+            }
+          });
+        }
+      });
+
       return stream;
     } catch (err) {
       console.warn('Browser media permission rejected or fallback:', err);
@@ -302,6 +332,13 @@ export default function App() {
       localStreamRef.current.getAudioTracks().forEach(t => { t.enabled = nextMicState; });
     }
 
+    setParticipants(prev => prev.map(p => {
+      if (p.isSelf) {
+        return { ...p, micEnabled: nextMicState };
+      }
+      return p;
+    }));
+
     broadcastStatusChange(nextMicState, videoEnabled, handRaised);
   };
 
@@ -316,6 +353,13 @@ export default function App() {
       localStreamRef.current.getVideoTracks().forEach(t => { t.enabled = nextVideoState; });
     }
 
+    setParticipants(prev => prev.map(p => {
+      if (p.isSelf) {
+        return { ...p, videoEnabled: nextVideoState, stream: localStreamRef.current };
+      }
+      return p;
+    }));
+
     broadcastStatusChange(micEnabled, nextVideoState, handRaised);
   };
 
@@ -323,6 +367,7 @@ export default function App() {
   const handleToggleHand = () => {
     const nextHand = !handRaised;
     setHandRaised(nextHand);
+    setParticipants(prev => prev.map(p => p.isSelf ? { ...p, handRaised: nextHand } : p));
     broadcastStatusChange(micEnabled, videoEnabled, nextHand);
   };
 
@@ -350,6 +395,11 @@ export default function App() {
       peerRef.current = null;
     }
 
+    // Auto-request local hardware stream if initial permissions set
+    if (!localStreamRef.current && (config.videoInitial || config.micInitial)) {
+      await requestMediaPermissions(config.videoInitial ?? true, config.micInitial ?? true);
+    }
+
     if (config.isOwner || config.isAdmin) {
       // Host Flow: Register Host Peer ID on PeerJS Cloud (e.g. meet-host-xxx-yyyy-zzz)
       const hostPeerId = `meet-host-${cleanCode}`;
@@ -371,12 +421,7 @@ export default function App() {
             call.answer(localStreamRef.current);
             peerCallsRef.current[call.peer] = call;
             call.on('stream', (remoteStream) => {
-              setParticipants(prev => prev.map(p => {
-                if (p.id === call.peer || p.peerId === call.peer) {
-                  return { ...p, stream: remoteStream };
-                }
-                return p;
-              }));
+              attachRemoteStreamToParticipant(call.peer, remoteStream);
             });
           });
         }
@@ -422,12 +467,7 @@ export default function App() {
             call.answer(localStreamRef.current);
             peerCallsRef.current[call.peer] = call;
             call.on('stream', (remoteStream) => {
-              setParticipants(prev => prev.map(p => {
-                if (p.id === call.peer || p.peerId === call.peer) {
-                  return { ...p, stream: remoteStream };
-                }
-                return p;
-              }));
+              attachRemoteStreamToParticipant(call.peer, remoteStream);
             });
           });
         }
@@ -458,8 +498,8 @@ export default function App() {
       name: config.userName,
       isSelf: true,
       isAdmin: config.isAdmin,
-      micEnabled: false,
-      videoEnabled: false,
+      micEnabled: micEnabled,
+      videoEnabled: videoEnabled,
       handRaised: false,
       isSpeaking: false,
       color: '#1a73e8',
@@ -483,8 +523,8 @@ export default function App() {
         id: selfUser.id,
         name: selfUser.name,
         isAdmin: selfUser.isAdmin,
-        micEnabled: false,
-        videoEnabled: false,
+        micEnabled: micEnabled,
+        videoEnabled: videoEnabled,
         handRaised: false,
         color: '#34a853'
       }
@@ -563,12 +603,7 @@ export default function App() {
         if (call) {
           peerCallsRef.current[request.peerId] = call;
           call.on('stream', (remoteStream) => {
-            setParticipants(prev => prev.map(p => {
-              if (p.id === request.userId || p.peerId === request.peerId) {
-                return { ...p, stream: remoteStream };
-              }
-              return p;
-            }));
+            attachRemoteStreamToParticipant(request.peerId, remoteStream);
           });
         }
       } catch (err) {
