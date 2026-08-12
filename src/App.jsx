@@ -281,12 +281,19 @@ export default function App() {
   }, []);
 
   // Request browser hardware permissions and capture live stream
-  const requestMediaPermissions = async (requestVideo = true, requestAudio = true) => {
+  const requestMediaPermissions = async (requestVideo = false, requestAudio = true) => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const constraints = {
         video: requestVideo ? { width: { ideal: 1280 }, height: { ideal: 720 } } : false,
         audio: requestAudio
-      });
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+      // Stop previous video tracks if video is not requested to release camera hardware
+      if (!requestVideo && localStreamRef.current) {
+        localStreamRef.current.getVideoTracks().forEach(t => t.stop());
+      }
 
       localStreamRef.current = stream;
       setLocalStream(stream);
@@ -347,10 +354,46 @@ export default function App() {
     const nextVideoState = !videoEnabled;
     setVideoEnabled(nextVideoState);
 
-    if (nextVideoState && !localStreamRef.current) {
-      await requestMediaPermissions(true, micEnabled);
-    } else if (localStreamRef.current) {
-      localStreamRef.current.getVideoTracks().forEach(t => { t.enabled = nextVideoState; });
+    if (nextVideoState) {
+      // Turn Camera ON: Acquire video stream and attach track
+      try {
+        const videoStream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+        const newVideoTrack = videoStream.getVideoTracks()[0];
+
+        if (localStreamRef.current) {
+          localStreamRef.current.getVideoTracks().forEach(t => t.stop());
+          localStreamRef.current.addTrack(newVideoTrack);
+        } else {
+          localStreamRef.current = videoStream;
+          setLocalStream(videoStream);
+        }
+
+        // Replace track on active PeerJS calls
+        Object.values(peerCallsRef.current).forEach(call => {
+          if (call && call.peerConnection) {
+            const sender = call.peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
+            if (sender) {
+              sender.replaceTrack(newVideoTrack);
+            } else if (localStreamRef.current) {
+              try { call.peerConnection.addTrack(newVideoTrack, localStreamRef.current); } catch (e) {}
+            }
+          }
+        });
+      } catch (err) {
+        console.warn('Camera access error:', err);
+        setVideoEnabled(false);
+        return;
+      }
+    } else {
+      // Turn Camera OFF: STOP video track completely to turn off physical camera LED light
+      if (localStreamRef.current) {
+        localStreamRef.current.getVideoTracks().forEach(t => {
+          t.stop();
+          localStreamRef.current.removeTrack(t);
+        });
+      }
     }
 
     setParticipants(prev => prev.map(p => {

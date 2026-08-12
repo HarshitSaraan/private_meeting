@@ -42,7 +42,7 @@ export default function HomeLobby({
       isOwner: true,
       userName: userName.trim(),
       micInitial: true,
-      videoInitial: true
+      videoInitial: false
     });
   };
 
@@ -72,7 +72,7 @@ export default function HomeLobby({
       isOwner: false,
       userName: userName.trim(),
       micInitial: true,
-      videoInitial: true
+      videoInitial: false
     });
   };
 
@@ -88,7 +88,7 @@ export default function HomeLobby({
       userName: userName.trim(),
       passcode: meeting.passcode,
       micInitial: true,
-      videoInitial: true
+      videoInitial: false
     });
   };
 
